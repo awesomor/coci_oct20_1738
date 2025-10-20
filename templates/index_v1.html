@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <title>Waveform Player + RMS Detector</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>🎧 오디오 파형 시각화 + 소리 인지 장치 (RMS)</h1>
+
+    <!-- 파형을 그리는 캔버스 -->
+    <canvas id="wave" width="1200" height="240"></canvas>
+
+    <!-- 👇 소리 인지 장치: 중앙의 사각형 상태 표시기 (빨강/초록) -->
+    <div class="indicator-row">
+      <div id="voice-indicator" class="voice-indicator off" title="Sound Detector"></div>
+      <div class="indicator-text">
+        <span>RMS: <span id="rms-value">0.0000</span></span>
+        <span class="sep">|</span>
+        <span>THRESHOLD: <span id="threshold-value">0.03</span></span>
+      </div>
+    </div>
+
+    <!-- Threshold 슬라이더 -->
+    <div class="slider-row">
+      <label for="threshold-slider">감도(Threshold)</label>
+      <input id="threshold-slider" type="range" min="0.01" max="0.10" step="0.001" value="0.03" />
+      <small class="slider-hint">작을수록 민감해짐 · 권장 시작값 0.03</small>
+    </div>
+
+    <!-- 🎛 재생 / 일시정지 통합 버튼 -->
+    <div class="controls">
+      <button id="playPauseBtn">▶ 재생</button>
+      <span id="timeLabel">00:00 / 00:00</span>
+    </div>
+
+    <!-- 시크바 -->
+    <input id="seek" type="range" min="0" max="1000" value="0" />
+
+    <!-- 숨겨진 실제 플레이어 -->
+    <audio id="player" src="{{ audio_url }}" preload="auto" crossorigin="anonymous"></audio>
+  </div>
+
+  <script>
+    const audioUrl = "{{ audio_url }}";
+    const canvas = document.getElementById('wave');
+    const ctx = canvas.getContext('2d');
+    const player = document.getElementById('player');
+    const playPauseBtn = document.getElementById('playPauseBtn');
+    const seek = document.getElementById('seek');
+    const timeLabel = document.getElementById('timeLabel');
+
+    const indicator = document.getElementById('voice-indicator');
+    const rmsValueEl = document.getElementById('rms-value');
+    const thresholdValueEl = document.getElementById('threshold-value');
+    const thresholdSlider = document.getElementById('threshold-slider');
+
+    let audioBuffer = null;
+    let peaks = null;
+    let animId = null;
+    let isPointerDown = false;
+    let audioCtx = null;
+    let channelData = null;
+
+    const BLOCK_SECONDS = 0.1;
+    let threshold = parseFloat(thresholdSlider.value);
+
+    function fmt(t) {
+      if (!isFinite(t)) return "00:00";
+      const m = Math.floor(t / 60);
+      const s = Math.floor(t % 60);
+      return `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+    }
+
+    async function loadAndDecode() {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const res = await fetch(audioUrl, { cache: 'no-store' });
+      const arr = await res.arrayBuffer();
+      audioBuffer = await audioCtx.decodeAudioData(arr);
+
+      buildPeaks();
+      channelData = audioBuffer.getChannelData(0);
+
+      draw();
+      updateTime();
+      requestTick();
+      startRMSDetector();
+    }
+
+    function buildPeaks() {
+      const chanData = audioBuffer.getChannelData(0);
+      const samplesPerPixel = Math.max(1, Math.floor(chanData.length / canvas.width));
+      peaks = new Float32Array(canvas.width);
+      for (let x = 0; x < canvas.width; x++) {
+        const start = x * samplesPerPixel;
+        const end = Math.min(start + samplesPerPixel, chanData.length);
+        let min = 1.0, max = -1.0;
+        for (let i = start; i < end; i++) {
+          const v = chanData[i];
+          if (v < min) min = v;
+          if (v > max) max = v;
+        }
+        peaks[x] = Math.max(Math.abs(min), Math.abs(max));
+      }
+    }
+
+    function draw() {
+      const w = canvas.width;
+      const h = canvas.height;
+      ctx.clearRect(0, 0, w, h);
+
+      ctx.fillStyle = "#44506b";
+      const mid = h / 2;
+      for (let x = 0; x < w; x++) {
+        const amp = peaks ? peaks[x] : 0;
+        const y = amp * (h * 0.45);
+        ctx.fillRect(x, mid - y, 1, y * 2);
+      }
+
+      const frac = player.duration ? (player.currentTime / player.duration) : 0;
+      const playedX = Math.max(0, Math.min(w, Math.floor(w * frac)));
+
+      ctx.save();
+      ctx.globalCompositeOperation = 'difference';
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, playedX, h);
+      ctx.restore();
+
+      ctx.beginPath();
+      ctx.moveTo(playedX + 0.5, 0);
+      ctx.lineTo(playedX + 0.5, h);
+      ctx.strokeStyle = "#ff5555";
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+
+    function updateTime() {
+      timeLabel.textContent = `${fmt(player.currentTime)} / ${fmt(player.duration)}`;
+      if (!isPointerDown && player.duration) {
+        const frac = player.currentTime / player.duration;
+        seek.value = String(Math.floor(frac * 1000));
+      }
+    }
+
+    function requestTick() {
+      cancelAnimationFrame(animId);
+      animId = requestAnimationFrame(tick);
+    }
+
+    function tick() {
+      draw();
+      updateTime();
+      animId = requestAnimationFrame(tick);
+    }
+
+    function calculateRMS(samples) {
+      let sum = 0;
+      const N = samples.length;
+      for (let i = 0; i < N; i++) sum += samples[i] * samples[i];
+      return Math.sqrt(sum / Math.max(N, 1));
+    }
+
+    function getCurrentBlockSamples() {
+      if (!audioBuffer || !channelData) return null;
+      const sr = audioBuffer.sampleRate;
+      const blockSize = Math.floor(BLOCK_SECONDS * sr);
+      const t = player.currentTime || 0;
+      const endIndex = Math.floor(t * sr);
+      const startIndex = Math.max(0, endIndex - blockSize);
+      if (endIndex <= 0) return null;
+      return channelData.subarray(startIndex, endIndex);
+    }
+
+    function startRMSDetector() {
+      updateRMSIndicator();
+      setInterval(() => {
+        updateRMSIndicator();
+      }, 100);
+    }
+
+    function updateRMSIndicator() {
+      const samples = getCurrentBlockSamples();
+      let rms = 0.0;
+      if (samples && samples.length > 0) rms = calculateRMS(samples);
+      rmsValueEl.textContent = rms.toFixed(4);
+      thresholdValueEl.textContent = threshold.toFixed(3);
+
+      if (rms > threshold) {
+        indicator.classList.remove('off');
+        indicator.classList.add('on');
+      } else {
+        indicator.classList.remove('on');
+        indicator.classList.add('off');
+      }
+    }
+
+    // 🎛 재생/일시정지 토글 버튼
+    playPauseBtn.onclick = () => {
+      if (player.paused) {
+        player.play();
+        playPauseBtn.textContent = "⏸ 일시정지";
+        playPauseBtn.classList.add('playing');
+      } else {
+        player.pause();
+        playPauseBtn.textContent = "▶ 재생";
+        playPauseBtn.classList.remove('playing');
+      }
+    };
+
+    seek.addEventListener('pointerdown', () => { isPointerDown = true; });
+    seek.addEventListener('pointerup', () => {
+      isPointerDown = false;
+      const frac = Number(seek.value) / 1000;
+      if (player.duration) player.currentTime = frac * player.duration;
+    });
+    seek.addEventListener('input', () => {
+      if (isPointerDown && player.duration) {
+        const frac = Number(seek.value) / 1000;
+        player.currentTime = frac * player.duration;
+      }
+    });
+
+    player.addEventListener('loadedmetadata', updateTime);
+    thresholdSlider.addEventListener('input', () => {
+      threshold = parseFloat(thresholdSlider.value);
+      thresholdValueEl.textContent = threshold.toFixed(3);
+      updateRMSIndicator();
+    });
+
+    loadAndDecode().catch(err => {
+      console.error(err);
+      alert("오디오를 불러오는 중 오류가 발생했습니다.");
+    });
+  </script>
+</body>
+</html>

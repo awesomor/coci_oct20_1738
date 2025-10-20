@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <title>Wave Player + RMS VAD Chunking + Whisper (HTTP)</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    /* 자막/상태 스타일 */
+    .chunk-item .pill{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:6px;background:#22c55e}
+    .chunk-item.sending{opacity:.7}
+    .chunk-text{color:#0f172a;margin-left:6px}
+    .error{color:#ef4444}
+  </style>
+</head>
+<body>
+  <main class="container">
+    <h1>🎧 Wave Player + RMS 기반 청킹(0.6s 무음) → Whisper (HTTP Proxy)</h1>
+
+    <!-- 오디오 플레이어 -->
+    <audio id="player" src="/media/sample.wav" controls class="audio"></audio>
+
+    <!-- 파형 캔버스 -->
+    <canvas id="wave-canvas" class="wave"></canvas>
+
+    <!-- 청크 타임라인 -->
+    <div class="row">
+      <label class="label">Chunks</label>
+      <canvas id="chunk-canvas" class="chunk-timeline"></canvas>
+    </div>
+
+    <!-- 상태 UI -->
+    <div class="grid">
+      <div>
+        <div class="label">RMS (100ms)</div>
+        <div id="rms-val" class="mono">0.0000</div>
+      </div>
+      <div>
+        <div class="label">Threshold</div>
+        <input id="thresh" type="range" min="0.01" max="0.10" step="0.005" value="0.03" />
+        <div><span class="mono" id="thresh-val">0.03</span></div>
+      </div>
+      <div>
+        <div class="label">Voice</div>
+        <div id="voice-box" class="voice-indicator off"></div>
+      </div>
+      <div>
+        <div class="label">Silence (ms)</div>
+        <div id="silence-ms" class="mono">0</div>
+      </div>
+      <div>
+        <div class="label">STT</div>
+        <div class="mono" style="font-size:12px">HTTP /stt-proxy 사용</div>
+      </div>
+    </div>
+
+    <!-- 청크 로그 -->
+    <div class="row">
+      <label class="label">Chunk Log (실시간 자막)</label>
+      <div id="chunk-log" class="chunk-log"></div>
+    </div>
+  </main>
+
+  <script>
+    // ===============================
+    // 청킹 파라미터
+    // ===============================
+    const SILENCE_MS_TO_SPLIT = 600;
+    const RMS_WINDOW_SEC = 0.1;
+    const POLL_MS = 100;
+
+    // ===============================
+    // 엘리먼트
+    // ===============================
+    const playerEl = document.getElementById("player");
+    const waveCanvas = document.getElementById("wave-canvas");
+    const chunkCanvas = document.getElementById("chunk-canvas");
+    const voiceBox = document.getElementById("voice-box");
+    const rmsValEl = document.getElementById("rms-val");
+    const threshEl = document.getElementById("thresh");
+    const threshValEl = document.getElementById("thresh-val");
+    const silenceMsEl = document.getElementById("silence-ms");
+    const chunkLogEl = document.getElementById("chunk-log");
+
+    // ===============================
+    // 오디오 컨텍스트
+    // ===============================
+    let audioCtx = null;
+    let audioBuffer = null;
+    let channelData = null;
+    let sampleRate = 48000;
+
+    // ===============================
+    // 청킹 상태
+    // ===============================
+    let threshold = parseFloat(threshEl.value);
+    let pollingTimer = null;
+    let isSpeaking = false;
+    let currentChunkStart = null;
+    let silenceAccumMs = 0;
+    const chunks = [];
+
+    // ===============================
+    // 기본 유틸
+    // ===============================
+    function calculateRMS(samples) {
+      let sum = 0;
+      for (let i = 0; i < samples.length; i++) {
+        const v = samples[i];
+        sum += v * v;
+      }
+      return Math.sqrt(sum / Math.max(1, samples.length));
+    }
+
+    function formatSec(sec) {
+      return (Math.max(0, sec)).toFixed(2) + "s";
+    }
+
+    // ===============================
+    // WAV 인코딩 (16-bit PCM)
+    // ===============================
+    function floatTo16BitPCM(output, offset, input) {
+      for (let i = 0; i < input.length; i++, offset += 2) {
+        let s = Math.max(-1, Math.min(1, input[i]));
+        s = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        output.setInt16(offset, s, true);
+      }
+    }
+
+    function writeString(view, offset, string) {
+      for (let i = 0; i < string.length; i++) {
+        view.setUint8(offset + i, string.charCodeAt(i));
+      }
+    }
+
+    function encodeWAV(samples, sampleRate) {
+      const numChannels = 1;
+      const bytesPerSample = 2; 
+      const blockAlign = numChannels * bytesPerSample;
+      const byteRate = sampleRate * blockAlign;
+      const dataSize = samples.length * bytesPerSample;
+
+      const buffer = new ArrayBuffer(44 + dataSize);
+      const view = new DataView(buffer);
+
+      writeString(view, 0, "RIFF");
+      view.setUint32(4, 36 + dataSize, true);
+      writeString(view, 8, "WAVE");
+
+      writeString(view, 12, "fmt ");
+      view.setUint32(16, 16, true);
+      view.setUint16(20, 1, true);
+      view.setUint16(22, numChannels, true);
+      view.setUint32(24, sampleRate, true);
+      view.setUint32(28, byteRate, true);
+      view.setUint16(32, blockAlign, true);
+      view.setUint16(34, bytesPerSample * 8, true);
+
+      writeString(view, 36, "data");
+      view.setUint32(40, dataSize, true);
+      floatTo16BitPCM(view, 44, samples);
+
+      return new Blob([view], { type: "audio/wav" });
+    }
+
+    // ===============================
+    // Chunk Log UI
+    // ===============================
+    function createChunkLogItem(chunk) {
+      const div = document.createElement("div");
+      div.className = "chunk-item";
+      const pill = document.createElement("span");
+      pill.className = "pill";
+      const mainText = document.createElement("span");
+      mainText.className = "mono";
+      mainText.textContent = `Chunk ${chunks.length}: ${formatSec(chunk.start)} ~ ${formatSec(chunk.end)} (len ${(chunk.end - chunk.start).toFixed(2)}s)`;
+      const sttText = document.createElement("span");
+      sttText.className = "chunk-text";
+      sttText.textContent = "";
+      div.appendChild(pill);
+      div.appendChild(mainText);
+      div.appendChild(sttText);
+      chunkLogEl.prepend(div);
+      return { container: div, sttEl: sttText };
+    }
+
+    function renderChunkText(chunkRef) {
+      if (!chunkRef || !chunkRef.elInfo) return;
+      chunkRef.elInfo.container.classList.remove("sending");
+      if (chunkRef.text && chunkRef.text.trim().length > 0) {
+        chunkRef.elInfo.sttEl.textContent = ' → "' + chunkRef.text.trim() + '"';
+        chunkRef.elInfo.sttEl.classList.remove("error");
+      } else {
+        chunkRef.elInfo.sttEl.textContent = " → (no text)";
+        chunkRef.elInfo.sttEl.classList.add("error");
+      }
+    }
+
+    // ===============================
+    // ✅ HTTP STT 전송
+    // ===============================
+    async function sendChunkToWhisper_HTTP(chunkRef) {
+      try {
+        const startIdx = Math.max(0, Math.floor(chunkRef.start * sampleRate));
+        const endIdx   = Math.min(channelData.length, Math.floor(chunkRef.end * sampleRate));
+        const mono = channelData.subarray(startIdx, endIdx);
+
+        const wavBlob = encodeWAV(mono, sampleRate);
+
+        // sending 표시
+        if (chunkRef.elInfo?.container) chunkRef.elInfo.container.classList.add("sending");
+
+        const fd = new FormData();
+        fd.append("file", wavBlob, "chunk.wav");
+
+        const resp = await fetch("/stt-proxy", {
+          method: "POST",
+          body: fd,
+        });
+
+        const j = await resp.json();
+        if (j.ok) {
+          chunkRef.text = j.text || "";
+          renderChunkText(chunkRef);
+        } else {
+          if (chunkRef.elInfo) {
+            chunkRef.elInfo.container.classList.remove("sending");
+            chunkRef.elInfo.sttEl.textContent = " → (error: " + j.error + ")";
+            chunkRef.elInfo.sttEl.classList.add("error");
+          }
+        }
+
+      } catch (e) {
+        if (chunkRef.elInfo) {
+          chunkRef.elInfo.container.classList.remove("sending");
+          chunkRef.elInfo.sttEl.textContent = " → (send failed)";
+          chunkRef.elInfo.sttEl.classList.add("error");
+        }
+        console.error("sendChunkToWhisper_HTTP error", e);
+      }
+    }
+
+    // ===============================
+    // Poll & Chunk Detection
+    // ===============================
+    // [생략: 기존 청킹 poll 코드와 동일 — 청크 확정 시 아래 호출]
+    // sendChunkToWhisper_HTTP(chunk)
+    // ===============================
+
+  </script>
+</body>
+</html>
