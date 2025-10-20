@@ -1,6 +1,27 @@
-node_modules/
-.env
-venv/
+# Python
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.env
+.venv/
+venv/
+
+# Node/Vite(있을 때)
+node_modules/
 dist/
-build/
+.vite/
+
+# OS/IDE
+.DS_Store
+Thumbs.db
+.vscode/
+
+# 데이터/미디어(용량 큰 것 제외 권장)
+media/*.wav
+!media/sample.wav
+
+# 로그/캐시
+*.log
+.cache/

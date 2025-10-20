@@ -2,89 +2,90 @@
 <html lang="ko">
 <head>
   <meta charset="utf-8" />
-  <title>Wave Player + RMS VAD Chunking + Whisper (HTTP Proxy)</title>
+  <title>Wave Player + Whisper(STT) + Similarity + Scene Background (Box)</title>
   <link rel="stylesheet" href="/static/style.css" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>
-    .stt-status{font-size:12px;color:#64748b;margin-left:8px}
-    .chunk-item .pill{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:6px;background:#22c55e}
-    .chunk-item.sending{opacity:.7}
-    .chunk-text{color:#0f172a;margin-left:6px}
-    .error{color:#ef4444}
-  </style>
 </head>
 <body>
   <main class="container">
-    <h1>🎧 Wave Player + RMS 기반 청킹(0.6s 무음) → Whisper (HTTP Proxy)</h1>
+    <h1>🎧 재생 + 🎭 배경(박스) + 📜 스크립트</h1>
 
-    <!-- 오디오 플레이어 -->
-    <audio id="player" src="/media/sample.wav" controls class="audio"></audio>
+    <div class="main-layout">
+      <!-- Left: 오디오 + 배경 박스 -->
+      <section class="left-panel">
+        <audio id="player" src="/media/sample.wav" controls class="audio"></audio>
 
-    <!-- 파형 캔버스 -->
-    <canvas id="wave-canvas" class="wave"></canvas>
+        <!-- 🎨 큰 사각형 배경 박스 (씬 전환 전용, 내부 페이드 레이어 2장) -->
+        <div id="bg-box" class="bg-box">
+          <div id="boxA" class="bg-box-layer"></div>
+          <div id="boxB" class="bg-box-layer"></div>
+        <!-- 🧑 Actor overlay (two frames: mouth closed / open) -->
+        <div id="actor" class="actor">
+          <img id="actor-closed" class="actor-frame show" src="/static/actor/closed.png" alt="actor-closed" />
+          <img id="actor-open" class="actor-frame" src="/static/actor/open.png" alt="actor-open" />
+        </div>
 
-    <!-- 청크 타임라인 (청크 구간이 초록 막대로 표시됨) -->
-    <div class="row">
-      <label class="label">Chunks</label>
-      <canvas id="chunk-canvas" class="chunk-timeline"></canvas>
-    </div>
+      </section>
 
-    <!-- 상태 UI -->
-    <div class="grid">
-      <div>
-        <div class="label">RMS (100ms)</div>
-        <div id="rms-val" class="mono">0.0000</div>
-      </div>
-      <div>
-        <div class="label">Threshold</div>
-        <input id="thresh" type="range" min="0.01" max="0.10" step="0.005" value="0.03" />
-        <div><span class="mono" id="thresh-val">0.03</span></div>
-      </div>
-      <div>
-        <div class="label">Voice</div>
-        <div id="voice-box" class="voice-indicator off"></div>
-      </div>
-      <div>
-        <div class="label">Silence (ms)</div>
-        <div id="silence-ms" class="mono">0</div>
-      </div>
-      <div>
-        <div class="label">STT</div>
-        <div class="stt-status"><span id="ws-state">HTTP /stt-proxy</span></div>
-      </div>
-    </div>
-
-    <!-- 청크 로그 -->
-    <div class="row">
-      <label class="label">Chunk Log (실시간 자막 붙임)</label>
-      <div id="chunk-log" class="chunk-log"></div>
+      <!-- Right: 스크립트 패널 (유지) -->
+      <aside class="right-panel">
+        <div class="script-header">
+          <div class="script-title">📜 스크립트 (Scene-aware)</div>
+          <div class="script-meta mono"><span id="script-count">0</span> lines / <span id="scene-count">0</span> scenes</div>
+        </div>
+        <div id="script-box" class="script-box"></div>
+      </aside>
     </div>
   </main>
 
   <script>
     // ===========================
-    // 청킹 파라미터
+    // 상수/설정
     // ===========================
-    const SILENCE_MS_TO_SPLIT = 600;   // 0.6초 무음 지속 시 청크 종료
-    const RMS_WINDOW_SEC = 0.1;        // 100ms RMS 계산 창
-    const POLL_MS = 100;               // 100ms 주기
+    let isTalkingVisual = false;  
+    // (선택) 미세 떨림 방지용 히스테리시스
+    const TALK_ON_FACTOR  = 1.00;  // threshold * 1.00 초과 시 "말함" 진입
+    const TALK_OFF_FACTOR = 0.95;  // threshold * 0.95 미만 시 "침묵" 복귀
+
+    // 유사도 윈도우 검색용 상태
+    let lastBestIdx = null;                   // 직전 최고 매치 인덱스
+    const WINDOW_BACK = 2;                    // 뒤로 2
+    const WINDOW_AHEAD = 3;                   // 앞으로 3
+    const SILENCE_MS_TO_SPLIT = 1000;   // 1.0s 무음으로 청크 끊기
+    const RMS_WINDOW_SEC = 0.1;         // 100ms RMS
+    const POLL_MS = 100;                // 100ms 간격
+    const MATCH_THRESHOLD = 90;         // 유사도 하이라이트 기준
+    const BG_BASE = '/static/bg/scene'; // 씬 배경 경로 prefix
+    const FIXED_THRESHOLD = 0.03;       // UI 슬라이더 제거 → 고정 임계값
+
+    // 씬 진행도 추적: sceneId -> Set(이 씬에서 90%↑ 매치된 줄 idx)
+    const sceneProgress = new Map();
 
     // ===========================
     // 엘리먼트
     // ===========================
     const playerEl = document.getElementById('player');
-    const waveCanvas = document.getElementById('wave-canvas');
-    const chunkCanvas = document.getElementById('chunk-canvas');
-    const voiceBox = document.getElementById('voice-box');
-    const rmsValEl = document.getElementById('rms-val');
-    const threshEl = document.getElementById('thresh');
-    const threshValEl = document.getElementById('thresh-val');
-    const silenceMsEl = document.getElementById('silence-ms');
-    const chunkLogEl = document.getElementById('chunk-log');
-    const wsStateEl = document.getElementById('ws-state');
+    const scriptCountEl = document.getElementById('script-count');
+    const sceneCountEl = document.getElementById('scene-count');
+    const scriptBoxEl = document.getElementById('script-box');
+
+    // 배경 박스의 2중 레이어 (페이드 전환)
+    const boxA = document.getElementById('boxA');
+    const boxB = document.getElementById('boxB');
+
+    // === Actor overlay control (two-frame lip sync) ===================
+    const ACTOR_FRAME_MS = 100; // 말할 때 프레임 전환 간격 (원하면 120~200ms 조절)
+    const actorEl = document.getElementById('actor');
+    const actorClosedEl = document.getElementById('actor-closed');
+    const actorOpenEl = document.getElementById('actor-open');
+    let speakingTimer = null;
+    let speakToggle = false;
+
+    let activeBg = 'A';
+    let currentScene = 0;
 
     // ===========================
-    // 오디오 컨텍스트/버퍼
+    // 오디오 버퍼
     // ===========================
     let audioCtx = null;
     let audioBuffer = null;
@@ -92,16 +93,24 @@
     let sampleRate = 48000;
 
     // ===========================
-    // 상태 머신
+    // 상태
     // ===========================
-    let threshold = parseFloat(threshEl.value);
+    let threshold = FIXED_THRESHOLD;
     let pollingTimer = null;
 
     let isSpeaking = false;
-    let currentChunkStart = null; // 초 단위
+    let currentChunkStart = null; // seconds
     let silenceAccumMs = 0;
-    const chunks = []; // {start, end, elInfo, text}
+    const chunks = []; // {start, end, text, total_s, stt_s, net_s, sim_pct}
 
+    // Scene-aware 데이터
+    let scriptLines = [];           // [{idx, text, scene}]
+    let sceneCount = 0;             // 총 씬 수
+    let linesByScene = new Map();   // scene -> [idx,...]
+    let lastIdxByScene = new Map(); // scene -> 마지막 줄 idx
+    let completedScenes = new Set();// 전환 완료된 scene 저장
+
+    
     // ===========================
     // 유틸
     // ===========================
@@ -110,134 +119,140 @@
       for (let i = 0; i < samples.length; i++) sum += samples[i] * samples[i];
       return Math.sqrt(sum / Math.max(1, samples.length));
     }
+    function formatSec(sec) { return (Math.max(0, sec)).toFixed(2) + 's'; }
 
-    function formatSec(sec) {
-      return (Math.max(0, sec)).toFixed(2) + 's';
-    }
+    // ===========================
+    // 🎭 Scene 전환: 배경 박스 내부 이미지 페이드
+    // ===========================
+    function changeBackground(nextScene) {
+      if (typeof nextScene !== 'number') return;
+      if (nextScene < 0) nextScene = 0;
+      if (sceneCount > 0 && nextScene > sceneCount) nextScene = sceneCount;
 
-    function drawWaveform() {
-      const ctx = waveCanvas.getContext('2d');
-      const w = waveCanvas.width = waveCanvas.clientWidth;
-      const h = waveCanvas.height = waveCanvas.clientHeight;
+      const nextUrl = `${BG_BASE}${nextScene}.jpg`;
 
-      ctx.clearRect(0, 0, w, h);
-      if (!channelData) return;
-
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-
-      const step = Math.ceil(channelData.length / w);
-      const mid = h / 2;
-      for (let x = 0; x < w; x++) {
-        const start = x * step;
-        const end = Math.min(start + step, channelData.length);
-        let min = 1.0, max = -1.0;
-        for (let i = start; i < end; i++) {
-          const v = channelData[i];
-          if (v < min) min = v;
-          if (v > max) max = v;
-        }
-        ctx.moveTo(x, (1 - min) * mid);
-        ctx.lineTo(x, (1 - max) * mid);
-      }
-      ctx.stroke();
-    }
-
-    function drawChunks() {
-      const ctx = chunkCanvas.getContext('2d');
-      const w = chunkCanvas.width = chunkCanvas.clientWidth;
-      const h = chunkCanvas.height = chunkCanvas.clientHeight;
-
-      ctx.clearRect(0, 0, w, h);
-
-      if (!audioBuffer) return;
-      const dur = audioBuffer.duration;
-
-      // 전체 바 틀
-      ctx.lineWidth = 1;
-      ctx.strokeRect(0.5, 0.5, w - 1, h - 1);
-
-      // 이미 확정된 청크
-      ctx.globalAlpha = 0.6;
-      for (const c of chunks) {
-        const x1 = (c.start / dur) * w;
-        const x2 = (c.end / dur) * w;
-        ctx.fillRect(x1, 0, Math.max(1, x2 - x1), h);
-      }
-      ctx.globalAlpha = 1.0;
-
-      // 진행 중인 청크 시각화
-      if (isSpeaking && currentChunkStart != null) {
-        const now = Math.min(playerEl.currentTime, dur);
-        const x1 = (currentChunkStart / dur) * w;
-        const x2 = (now / dur) * w;
-        ctx.fillRect(x1, 0, Math.max(1, x2 - x1), h);
-      }
-
-      // 플레이헤드
-      const headX = (playerEl.currentTime / dur) * w;
-      ctx.beginPath();
-      ctx.moveTo(headX, 0);
-      ctx.lineTo(headX, h);
-      ctx.stroke();
-    }
-
-    function setVoice(on) {
-      voiceBox.classList.toggle('on', !!on);
-      voiceBox.classList.toggle('off', !on);
-    }
-
-    function createChunkLogItem(chunk) {
-      const div = document.createElement('div');
-      div.className = 'chunk-item';
-      const pill = document.createElement('span');
-      pill.className = 'pill';
-      const text = document.createElement('span');
-      text.className = 'mono';
-      text.textContent = `Chunk ${chunks.length}: ${formatSec(chunk.start)} ~ ${formatSec(chunk.end)} (len ${(chunk.end - chunk.start).toFixed(2)}s)`;
-      const stt = document.createElement('span');
-      stt.className = 'chunk-text';
-      stt.textContent = ''; // Whisper 텍스트 들어갈 자리
-      div.appendChild(pill);
-      div.appendChild(text);
-      div.appendChild(stt);
-      chunkLogEl.prepend(div);
-      return { container: div, sttEl: stt };
-    }
-
-    function renderChunkText(chunkRef) {
-      if (!chunkRef || !chunkRef.elInfo) return;
-      const { container, sttEl } = chunkRef.elInfo;
-      container.classList.remove('sending');
-      if (chunkRef.text && chunkRef.text.trim().length > 0) {
-        sttEl.textContent = ' → "' + chunkRef.text.trim() + '"';
-        sttEl.classList.remove('error');
+      if (activeBg === 'A') {
+        boxB.style.backgroundImage = `url("${nextUrl}")`;
+        boxB.classList.add('show');
+        boxA.classList.remove('show');
+        activeBg = 'B';
       } else {
-        sttEl.textContent = ' → (no text)';
-        sttEl.classList.add('error');
+        boxA.style.backgroundImage = `url("${nextUrl}")`;
+        boxA.classList.add('show');
+        boxB.classList.remove('show');
+        activeBg = 'A';
+      }
+      currentScene = nextScene;
+    }
+
+    // ✅ 마지막 줄이면 다음 씬으로 전환
+    // 🎭 트리거: “해당 씬 모든 줄이 90%↑로 최소 1회 감지” + “마지막 줄 감지”
+    function checkSceneTrigger(bestIdx, pct) {
+      if (bestIdx == null || pct < MATCH_THRESHOLD) return;
+
+      const line = scriptLines.find(l => l.idx === bestIdx);
+      if (!line) return;
+      const sceneId = line.scene || 1;
+
+      const lastIdx = lastIdxByScene.get(sceneId);
+      if (lastIdx == null) return;
+
+      const allPassed = isSceneCompletedByScore(sceneId);
+      if (bestIdx === lastIdx && allPassed) {
+        if (!completedScenes.has(sceneId)) {
+          completedScenes.add(sceneId);
+          changeBackground(sceneId + 1);
+        }
       }
     }
 
+
+    // 모든 줄이 90%↑ 달성했는지 검사
+    function isSceneCompletedByScore(sceneId) {
+      const arr = linesByScene.get(sceneId) || [];
+      const done = sceneProgress.get(sceneId);
+      return done && done.size >= arr.length;
+    }
+
+    // 후보 인덱스 윈도우 생성
+    function makeCandidateWindow(centerIdx) {
+      if (centerIdx == null) return null; // null이면 서버에서 전체 비교
+      const min = Math.max(0, centerIdx - WINDOW_BACK);
+      const max = Math.min(scriptLines.length - 1, centerIdx + WINDOW_AHEAD);
+      const out = [];
+      for (let i = min; i <= max; i++) out.push(i);
+      return out;
+    }
     // ===========================
-    // WAV 인코딩 (Mono, 16-bit PCM)
+    // ➕ 유사도 요청 & 결과 반영 (UI 최소화)
     // ===========================
-    function floatTo16BitPCM(output, offset, input) {
+    async function fetchSimilarity(chunkRef) {
+      try {
+        const text = (chunkRef.text || '').trim();
+        if (!text) return;
+
+        // ① 후보 생성: 최초 1회는 전체 비교 → candidates 생략
+        const candidates = makeCandidateWindow(lastBestIdx);
+        const body = candidates ? { text, candidates } : { text };
+
+        const resp = await fetch('/similar', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        const j = await resp.json();
+        if (!(j && j.ok)) return;
+
+        // ② 점수/인덱스 반영
+        const pctNum = typeof j.score_pct === 'number' ? j.score_pct : parseFloat(j.score_pct);
+        const pct = isNaN(pctNum) ? 0 : pctNum;
+        chunkRef.sim_pct = pct.toFixed(2);
+
+        if (j.best_idx !== null && j.best_idx !== undefined) {
+          lastBestIdx = j.best_idx; // 다음 창의 중심
+
+          // 90% 이상이면 진행도 갱신
+          if (pct >= MATCH_THRESHOLD) {
+            const line = scriptLines.find(l => l.idx === j.best_idx);
+            if (line) {
+              if (!sceneProgress.has(line.scene)) sceneProgress.set(line.scene, new Set());
+              sceneProgress.get(line.scene).add(line.idx);
+            }
+            // UI 반영 + 트리거 확인
+            highlightScriptLine(j.best_idx);
+            checkSceneTrigger(j.best_idx, pct);
+          }
+        }
+      } catch (e) {
+        console.error('similarity fetch failed', e);
+      }
+    }
+
+
+    // 🔵 스크립트 라인 하이라이트 + 자동 스크롤 (누적 유지)
+    function highlightScriptLine(bestIdx) {
+      const target = document.querySelector(`.script-line[data-idx="${bestIdx}"]`);
+      if (!target) return;
+      target.classList.add('matched');
+      target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+
+    // ===========================
+    // WAV 인코딩
+    // ===========================
+    function floatTo16BitPCM(view, offset, input) {
       for (let i = 0; i < input.length; i++, offset += 2) {
         let s = Math.max(-1, Math.min(1, input[i]));
         s = s < 0 ? s * 0x8000 : s * 0x7FFF;
-        output.setInt16(offset, s, true);
+        view.setInt16(offset, s, true);
       }
     }
-
     function writeString(view, offset, string) {
-      for (let i = 0; i < string.length; i++) {
-        view.setUint8(offset + i, string.charCodeAt(i));
-      }
+      for (let i = 0; i < string.length; i++) view.setUint8(offset + i, string.charCodeAt(i));
     }
-
     function encodeWAV(samples, sampleRate) {
       const numChannels = 1;
-      const bytesPerSample = 2; // 16-bit
+      const bytesPerSample = 2;
       const blockAlign = numChannels * bytesPerSample;
       const byteRate = sampleRate * blockAlign;
       const dataSize = samples.length * bytesPerSample;
@@ -245,95 +260,113 @@
       const buffer = new ArrayBuffer(44 + dataSize);
       const view = new DataView(buffer);
 
-      // RIFF chunk descriptor
       writeString(view, 0, 'RIFF');
       view.setUint32(4, 36 + dataSize, true);
       writeString(view, 8, 'WAVE');
 
-      // fmt sub-chunk
       writeString(view, 12, 'fmt ');
-      view.setUint32(16, 16, true);           // Subchunk1Size (16 for PCM)
-      view.setUint16(20, 1, true);            // AudioFormat (1 = PCM)
+      view.setUint32(16, 16, true);
+      view.setUint16(20, 1, true);
       view.setUint16(22, numChannels, true);
       view.setUint32(24, sampleRate, true);
       view.setUint32(28, byteRate, true);
       view.setUint16(32, blockAlign, true);
       view.setUint16(34, bytesPerSample * 8, true);
 
-      // data sub-chunk
       writeString(view, 36, 'data');
       view.setUint32(40, dataSize, true);
 
-      // PCM samples
       floatTo16BitPCM(view, 44, samples);
-
       return new Blob([view], { type: 'audio/wav' });
     }
 
+    function showClosed() {
+      actorClosedEl.classList.add('show');
+      actorOpenEl.classList.remove('show');
+    }
+    function showOpen() {
+      actorOpenEl.classList.add('show');
+      actorClosedEl.classList.remove('show');
+    }
+
+    function startSpeakingAnim() {
+      if (speakingTimer) return; // 이미 재생 중
+      // 즉시 오픈으로 시작 (더 자연스러우면 showClosed()로 시작해도 됨)
+      showOpen();
+      speakToggle = false;
+      speakingTimer = setInterval(() => {
+        speakToggle = !speakToggle;
+        if (speakToggle) showClosed(); else showOpen();
+      }, ACTOR_FRAME_MS);
+    }
+
+    function stopSpeakingAnim() {
+      if (speakingTimer) {
+        clearInterval(speakingTimer);
+        speakingTimer = null;
+      }
+      // 침묵일 때는 입 다문 프레임 유지
+      showClosed();
+    }
+
     // ===========================
-    // ✅ 청크 → WAV → /stt-proxy(HTTP) 전송
+    // ✅ STT 프록시 호출 (로그 UI 제거)
     // ===========================
     async function sendChunkToWhisper_HTTP(chunkRef) {
       try {
         const startIdx = Math.max(0, Math.floor(chunkRef.start * sampleRate));
         const endIdx   = Math.min(channelData.length, Math.floor(chunkRef.end * sampleRate));
         const mono = channelData.subarray(startIdx, endIdx);
-
         const wavBlob = encodeWAV(mono, sampleRate);
-
-        if (chunkRef.elInfo?.container) chunkRef.elInfo.container.classList.add('sending');
 
         const fd = new FormData();
         fd.append('file', wavBlob, 'chunk.wav');
 
-        const resp = await fetch('/stt-proxy', {
-          method: 'POST',
-          body: fd,
-        });
-
+        const resp = await fetch('/stt-proxy', { method: 'POST', body: fd });
         const j = await resp.json();
+
         if (j.ok) {
           chunkRef.text = j.text || '';
-          renderChunkText(chunkRef);
+          chunkRef.total_s = j.total_s;
+          chunkRef.stt_s = j.stt_s;
+          chunkRef.net_s = j.net_s;
+          await fetchSimilarity(chunkRef);
         } else {
-          if (chunkRef.elInfo) {
-            chunkRef.elInfo.container.classList.remove('sending');
-            chunkRef.elInfo.sttEl.textContent = ' → (error: ' + (j.error || `HTTP ${resp.status}`) + ')';
-            chunkRef.elInfo.sttEl.classList.add('error');
-          }
+          console.error('stt error:', j.error || resp.status);
         }
       } catch (e) {
-        if (chunkRef.elInfo) {
-          chunkRef.elInfo.container.classList.remove('sending');
-          chunkRef.elInfo.sttEl.textContent = ' → (send failed)';
-          chunkRef.elInfo.sttEl.classList.add('error');
-        }
         console.error('sendChunkToWhisper_HTTP error', e);
       }
     }
 
     // ===========================
-    // 폴링 루프 (100ms)
+    // 폴링 루프 (RMS 기반) — UI 출력 없이 동작
     // ===========================
     function poll() {
       if (!audioBuffer) return;
-
+      
       const sr = sampleRate;
       const windowSize = Math.floor(RMS_WINDOW_SEC * sr);
 
       const endIndex = Math.floor(playerEl.currentTime * sr);
       const startIndex = Math.max(0, endIndex - windowSize);
-
       const samples = channelData.subarray(startIndex, endIndex);
       const rms = calculateRMS(samples);
 
-      // UI
-      rmsValEl.textContent = rms.toFixed(4);
-      setVoice(rms > threshold);
+      const talkingNow =
+        isTalkingVisual
+          ? (rms >= threshold * TALK_OFF_FACTOR)   // 내려갈 땐 약간 관용
+          : (rms >= threshold * TALK_ON_FACTOR);   // 올라갈 땐 기준 그대로
+      
+      if (talkingNow && !isTalkingVisual) {
+        startSpeakingAnim();       // 즉시 시작
+        isTalkingVisual = true;
+      } else if (!talkingNow && isTalkingVisual) {
+        stopSpeakingAnim();        // 즉시 정지(입 다문 상태)
+        isTalkingVisual = false;
+      }
 
-      // 상태 머신
       const speakingNow = rms > threshold;
-
       if (speakingNow) {
         if (!isSpeaking) {
           isSpeaking = true;
@@ -349,11 +382,7 @@
             const chunkEnd = Math.max(0, playerEl.currentTime - (silenceAccumMs / 1000));
             if (currentChunkStart != null && chunkEnd - currentChunkStart > 0.05) {
               const chunk = { start: currentChunkStart, end: chunkEnd, text: "" };
-              const elInfo = createChunkLogItem(chunk);
-              chunk.elInfo = elInfo;
               chunks.push(chunk);
-
-              // 즉시 Whisper 전송 (HTTP)
               sendChunkToWhisper_HTTP(chunk);
             }
             isSpeaking = false;
@@ -364,22 +393,119 @@
           silenceAccumMs = Math.min(silenceAccumMs + POLL_MS, SILENCE_MS_TO_SPLIT);
         }
       }
-
-      silenceMsEl.textContent = silenceAccumMs.toString();
-
-      // 그리기
-      drawChunks();
     }
 
     // ===========================
-    // 로딩 & 초기화
+    // 스크립트 로드 & 렌더
+    // ===========================
+    async function loadAndRenderScript() {
+      const res = await fetch('/script');
+      const j = await res.json();
+      if (!j.ok) throw new Error('script load failed');
+
+      scriptLines = j.lines || [];
+      sceneCount = j.scene_count || 0;
+
+      // 씬 맵 구성
+      linesByScene.clear();
+      lastIdxByScene.clear();
+      for (const { idx, text, scene } of scriptLines) {
+        if (!linesByScene.has(scene)) linesByScene.set(scene, []);
+        linesByScene.get(scene).push(idx);
+      }
+      for (const [scene, arr] of linesByScene.entries()) {
+        arr.sort((a,b)=>a-b);
+        lastIdxByScene.set(scene, arr[arr.length-1]);
+      }
+
+      // 렌더
+      scriptCountEl.textContent = j.count ?? scriptLines.length;
+      sceneCountEl.textContent = sceneCount;
+      scriptBoxEl.innerHTML = '';
+
+      const frag = document.createDocumentFragment();
+
+      // 씬 번호 오름차순으로 그룹 생성
+      const sortedScenes = [...linesByScene.keys()].sort((a,b)=>a-b);
+      for (const scene of sortedScenes) {
+        const group = document.createElement('section');
+        group.className = 'scene-group';
+        group.setAttribute('data-scene', scene);
+
+        // 씬 헤더
+        const header = document.createElement('div');
+        header.className = 'scene-header';
+        header.innerHTML = `
+          <div class="scene-title">🎬 Scene ${scene}</div>
+          <div class="scene-meta mono">${linesByScene.get(scene).length} lines</div>
+        `;
+        group.appendChild(header);
+
+        // 씬 내용
+        const body = document.createElement('div');
+        body.className = 'scene-body';
+
+        for (const idx of linesByScene.get(scene)) {
+          const lineObj = scriptLines[idx];
+          const row = document.createElement('div');
+          row.className = 'script-line';
+          row.dataset.idx = lineObj.idx;
+          row.setAttribute('data-idx', lineObj.idx);
+          row.setAttribute('data-scene', scene);
+
+          const num = document.createElement('span');
+          num.className = 'script-num mono';
+          num.textContent = `${lineObj.idx}.`;
+
+          const content = document.createElement('span');
+          content.className = 'script-text';
+          content.textContent = lineObj.text;
+
+          row.appendChild(num);
+          row.appendChild(content);
+          body.appendChild(row);
+        }
+
+        group.appendChild(body);
+        frag.appendChild(group);
+      }
+
+      scriptBoxEl.appendChild(frag);
+    }
+
+    // 🔵 스크립트 라인 하이라이트 + 자동 스크롤 (씬 그룹 강조 포함)
+    function highlightScriptLine(bestIdx) {
+      const target = document.querySelector(`.script-line[data-idx="${bestIdx}"]`);
+      if (!target) return;
+      // 기존 라인 강조
+      target.classList.add('matched');
+
+      // 소속 씬 강조 & 약한 펄스
+      const scene = target.getAttribute('data-scene');
+      const group = document.querySelector(`.scene-group[data-scene="${scene}"]`);
+      if (group) {
+        group.classList.add('active');
+        clearTimeout(group._pulseTimer);
+        group.classList.add('pulse');
+        group._pulseTimer = setTimeout(() => group.classList.remove('pulse'), 700);
+      }
+
+      // 보기 영역 중앙 배치
+      target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+
+    // ===========================
+    // 초기화
     // ===========================
     async function initAudio() {
-      wsStateEl.textContent = 'HTTP /stt-proxy';
       audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+      // 초기 배경: scene0
+      changeBackground(0);
+
       const res = await fetch(playerEl.src);
       if (!res.ok) {
-        wsStateEl.textContent = "❗ audio fetch failed";
+        alert("❗ audio fetch failed");
         return;
       }
       const arrayBuf = await res.arrayBuffer();
@@ -387,47 +513,38 @@
       sampleRate = audioBuffer.sampleRate;
       channelData = audioBuffer.getChannelData(0);
 
-      drawWaveform();
-      drawChunks();
-
-      if (!pollingTimer) {
-        pollingTimer = setInterval(poll, POLL_MS);
-      }
+      if (!pollingTimer) pollingTimer = setInterval(poll, POLL_MS);
     }
 
     // 이벤트
-    playerEl.addEventListener('play', () => { audioCtx && audioCtx.resume(); });
-    playerEl.addEventListener('seeked', () => {
-      silenceAccumMs = 0;
-      drawChunks();
-    });
+    playerEl.addEventListener('play', () => { if (audioCtx) audioCtx.resume(); });
+    playerEl.addEventListener('seeked', () => { silenceAccumMs = 0; });
     playerEl.addEventListener('ended', () => {
+      if (!audioBuffer) return;
       if (isSpeaking && currentChunkStart != null) {
         const chunk = { start: currentChunkStart, end: audioBuffer.duration, text: "" };
-        const elInfo = createChunkLogItem(chunk);
-        chunk.elInfo = elInfo;
         chunks.push(chunk);
-        // 즉시 전송 (HTTP)
         sendChunkToWhisper_HTTP(chunk);
       }
       isSpeaking = false;
       currentChunkStart = null;
       silenceAccumMs = 0;
-      drawChunks();
-    });
-
-    threshEl.addEventListener('input', (e) => {
-      threshold = parseFloat(e.target.value);
-      threshValEl.textContent = threshold.toFixed(3);
-    });
-
-    window.addEventListener('resize', () => {
-      drawWaveform();
-      drawChunks();
+      if (isTalkingVisual) {
+        stopSpeakingAnim();
+        isTalkingVisual = false;
+      }
     });
 
     // 시작
-    initAudio();
+    (async () => {
+      try {
+        await loadAndRenderScript();
+        await initAudio();
+      } catch (e) {
+        console.error(e);
+        alert('초기화 실패: ' + e.message);
+      }
+    })();
   </script>
 </body>
 </html>
